@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Midas MSI definition (WiX Toolset 3.11 - https://wixtoolset.org).
+  Built by build_msi.bat, which also downloads the toolset itself and
+  generates installer\_files.generated.wxs (the harvested file list)
+  from dist\Midas. Do not list files here by hand.
+
+  - Installs the whole portable bundle into Program Files (per-machine).
+  - Start-menu + desktop shortcuts; clean uninstall via "Apps & features".
+  - User data lives in each user's %APPDATA%\Midas, so uninstalling
+    never deletes settings or download history.
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product Id="*"
+           Name="Midas"
+           Language="1033"
+           Version="$(var.ProductVersion)"
+           Manufacturer="Midas"
+           UpgradeCode="5b8f0e6a-93d4-4c57-a6b8-1f2d3c4e5a67">
+
+    <Package InstallerVersion="500"
+             Compressed="yes"
+             InstallScope="perMachine"
+             Description="Midas - turn links to gold" />
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Midas is already installed." />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFiles64Folder">
+        <Directory Id="INSTALLFOLDER" Name="Midas" />
+      </Directory>
+      <Directory Id="ProgramMenuFolder" />
+      <Directory Id="DesktopFolder" />
+    </Directory>
+
+    <DirectoryRef Id="ProgramMenuFolder">
+      <Component Id="StartMenuShortcut"
+                 Guid="9e1a4d20-6f3b-4a8e-b7c9-0d2e5f6a7b81">
+        <Shortcut Id="MidasStartMenuShortcut"
+                  Name="Midas"
+                  Description="Turn links to gold"
+                  Target="[INSTALLFOLDER]Midas.exe"
+                  WorkingDirectory="INSTALLFOLDER" />
+        <RegistryValue Root="HKCU" Key="Software\Midas"
+                       Name="startMenuShortcut" Type="integer" Value="1"
+                       KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+
+    <DirectoryRef Id="DesktopFolder">
+      <Component Id="DesktopShortcut"
+                 Guid="3c5d7e90-1a2b-4c6d-8e9f-a0b1c2d3e4f5">
+        <Shortcut Id="MidasDesktopShortcut"
+                  Name="Midas"
+                  Description="Turn links to gold"
+                  Target="[INSTALLFOLDER]Midas.exe"
+                  WorkingDirectory="INSTALLFOLDER" />
+        <RegistryValue Root="HKCU" Key="Software\Midas"
+                       Name="desktopShortcut" Type="integer" Value="1"
+                       KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+
+    <Feature Id="Main" Title="Midas" Level="1">
+      <ComponentGroupRef Id="MidasFiles" />
+      <ComponentRef Id="StartMenuShortcut" />
+      <ComponentRef Id="DesktopShortcut" />
+    </Feature>
+  </Product>
+</Wix>
