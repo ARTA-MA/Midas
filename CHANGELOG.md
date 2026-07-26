@@ -6,6 +6,58 @@ version are attached to the matching entry on the
 
 ---
 
+## v1.2.0
+
+### Added
+- **Full Spotify playlists, whatever their size.** Track discovery now uses
+  the partner GraphQL API that `open.spotify.com` itself paginates with
+  while logged out, so playlists past the old 100-track ceiling come back
+  complete. Nothing is required from you: no login, no cookies, no API keys
+  or client secret. Verified end to end on a 323-track playlist.
+- **`engine/midas_engine/core/soundcloud.py`** - keyless SoundCloud
+  metadata: real track names, artists, durations and 500x500 per-track
+  artwork, read from the set page's own hydration blob plus the public
+  track API in batches of 50 (cached 15 minutes, budget-limited).
+- **Per-track artwork in the UI.** Playlist entries now carry their own
+  cover, so both playlist pickers render a small round cover per row.
+- **Offline regression suite** (`engine/tests/stress_test.py`) covering
+  pagination, name fallbacks, artwork resolution, the rate-limit breaker,
+  and hostile/malformed input.
+
+### Improved
+- **Spotify analysis is dramatically faster: ~34.6s -> ~2.4s cold** (0.8s
+  warm) on a 323-track playlist.
+  - The rate-limited public Web API is no longer tried first; the partner
+    API (complete *and* fast) runs first for playlists.
+  - A `429` is never slept on or retried - it is recorded and abandoned
+    instantly, keeping whatever rows already arrived.
+  - A process-wide cooldown breaker (5 min .. 1 h) makes later links skip
+    the Web API entirely instead of re-discovering the rate limit. Spotify
+    answers with `Retry-After` values of ~19 hours, which the cap prevents
+    from disabling the path for a whole day.
+  - The persisted-query hash is used optimistically from cache, so the
+    multi-megabyte web-player JS bundle is only downloaded when Spotify
+    actually rejects the query.
+  - Overall extraction deadline lowered 45s -> 30s now that the slow path
+    is off the happy path.
+- **Live queue cards show the right cover.** A playlist job starts on the
+  first selected track's artwork and follows yt-dlp through the set, so the
+  card matches the artwork embedded in the finished file.
+
+### Fixed
+- SoundCloud set entries showed **"Item 1, Item 2, Item 3, ..."** instead of
+  track names. yt-dlp's flat listing returns no title at all for SoundCloud
+  sets (106/106 entries were blank on the test set); real names are now
+  resolved by track id, `webpage_url` or `url`, with the URL slug and only
+  then the old placeholder as fallbacks.
+- Playlist previews and in-progress downloads showed the **playlist icon**
+  for every track even though the finished files had correct per-track
+  covers.
+- Spotify album names are read from partner rows (`albumOfTrack.name` /
+  `album.name`), keeping tags and cover art correct for those tracks.
+
+---
+
 ## v1.1.0
 
 ### Added

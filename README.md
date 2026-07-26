@@ -10,17 +10,36 @@ Grab **`Midas-Setup.msi`** from the [Releases page](../../releases) and run
 it - no other setup. (The installer is unsigned, so SmartScreen may show
 "unknown publisher"; click *More info > Run anyway*.)
 
+## What's new in v1.2
+
+- **Spotify playlists are no longer capped at 100 tracks.** Track discovery
+  now uses the same partner GraphQL API the logged-out web player paginates
+  with, so a playlist of any size comes back complete - no login, no API
+  keys, nothing for you to provide. Verified on a 323-track playlist.
+- **Spotify links analyze in ~2s instead of ~35s.** The rate-limited public
+  Web API is no longer tried first, a `429` is never slept on, and a
+  process-wide cooldown makes later links skip it entirely.
+- **Real SoundCloud track names.** Set entries used to read "Item 1, Item
+  2, ..."; they now show the actual titles, read from SoundCloud's own
+  public metadata in a couple of batched requests.
+- **Per-track artwork everywhere.** Playlist pickers and the live queue card
+  show the cover of the track being downloaded instead of the playlist icon,
+  matching what ends up embedded in the finished files.
+
+Details: [docs/CODE_CHANGES_v1.2.md](docs/CODE_CHANGES_v1.2.md) ·
+[CHANGELOG.md](CHANGELOG.md)
+
 ## Features
 
 - **One paste box** - YouTube, Spotify, SoundCloud, Instagram, TikTok,
   Reddit; auto-detects the platform and single-vs-playlist.
 - **Preview card** - title, uploader, duration, thumbnail, playlist track
-  picker; per-download quality/format overrides (audio-only platforms skip
-  video options automatically).
+  picker with per-track covers; per-download quality/format overrides
+  (audio-only platforms skip video options automatically).
 - **Clip downloads** - grab just a time-section of a video (YouTube,
   Instagram, TikTok, Reddit).
-- **Queue and history** - concurrent downloads, cancel, resume-on-retry,
-  SQLite history, embedded cover art shown for local files.
+- **Queue and history** - concurrent downloads, cancel, pause/resume,
+  resume-on-retry, SQLite history, embedded cover art shown for local files.
 - **Studio** - post-process any finished item: convert formats, trim, crop
   the picture, edit cover art / metadata.
 - **Self-managing dependencies** - Deno, yt-dlp and ffmpeg are installed
@@ -50,7 +69,8 @@ Other design choices:
 
 - **yt-dlp runs as the vendored `vendor\yt-dlp.exe` subprocess**, not as an imported library → the *Update yt-dlp* button is a simple file replacement, no re-packaging.
 - The vendor folder (with `deno.exe` as yt-dlp's JS runtime and `ffmpeg`/`ffprobe`) is prepended to `PATH` for every job, so yt-dlp finds everything automatically. Fully portable — nothing touches the system.
-- **Spotify without any API:** the public oEmbed endpoint + the embed page's inline JSON give track/artist/album/cover (same approach as spotdl's metadata layer); the engine then searches **YouTube proper** via `ytsearch1:"artist - title"` and tags the audio (ID3/MP4/FLAC/Opus + cover art) with mutagen.
+- **Spotify without any API:** the public oEmbed endpoint + the embed page's inline JSON give track/artist/album/cover (same approach as spotdl's metadata layer), and the web player's own partner GraphQL API paginates long playlists in full; the engine then searches **YouTube proper** via `ytsearch1:"artist - title"` and tags the audio (ID3/MP4/FLAC/Opus + cover art) with mutagen.
+- **SoundCloud without any API keys:** the set page's `window.__sc_hydration` blob plus the site's own public `client_id` give real track names, artists, durations and 500x500 per-track artwork in batches of 50.
 - **YouTube chapters:** `--embed-chapters` handles native chapters; if a video has none, the engine parses timestamps out of the description and injects them with ffmpeg (`FFMETADATA` remux, stream-copy so it's instant).
 
 ## Folder structure
@@ -61,16 +81,18 @@ midas/
 ├── build_msi.bat        ← one-click installer build → dist\Midas-Setup.msi
 ├── publish_to_github.bat← push this source to your own GitHub repo
 ├── installer/           ← WiX definition used by build_msi.bat
-├── docs/                ← HOW_IT_WORKS.md + release-notes templates
+├── docs/                ← HOW_IT_WORKS.md, code-change docs, release notes
 ├── run_dev.bat          ← dev mode (engine on :8765 + flutter run)
 ├── engine/              ← Python engine
 │   ├── main.py          ← entrypoint (prints MIDAS_ENGINE_PORT=… for the UI)
+│   ├── tests/           ← offline regression/stress suite (stress_test.py)
 │   └── midas_engine/
 │       ├── api/app.py   ← FastAPI routes + /events WebSocket + watchdog
 │       ├── core/
 │       │   ├── analyzer.py    ← URL → platform / single-vs-playlist / preview
 │       │   ├── downloader.py  ← queue, yt-dlp subprocesses, progress, tagging
-│       │   ├── spotify.py     ← keyless Spotify metadata (oEmbed + embed page)
+│       │   ├── spotify.py     ← keyless Spotify metadata (oEmbed + embed + partner API)
+│       │   ├── soundcloud.py  ← keyless SoundCloud track names + per-track art
 │       │   ├── chapters.py    ← description-timestamp → embedded chapters
 │       │   ├── deps.py        ← Deno / yt-dlp / ffmpeg install & updates
 │       │   └── history.py     ← SQLite download history
@@ -96,8 +118,28 @@ Run **`build_msi.bat`** - it reuses (or first builds) `dist\Midas`, downloads
 the WiX toolset automatically, and produces the single-file
 **`dist\Midas-Setup.msi`** (per-machine install, shortcuts, clean
 uninstall). Attach that file to a GitHub release - see
-[docs/RELEASE_NOTES_v1.1.0.md](docs/RELEASE_NOTES_v1.1.0.md) for the
+[docs/RELEASE_NOTES_v1.2.md](docs/RELEASE_NOTES_v1.2.md) for the
 ready-made release text.
+
+The installer can also be built and published by CI: the
+`.github/workflows/release-v1.2.yml` workflow runs `build_msi.bat` on a
+Windows runner and attaches `Midas-Setup.msi` to the release. Start it from
+the **Actions** tab (*Run workflow*) or by pushing the `v1.2.0` tag. A
+Windows machine is required either way - an `.msi` cannot be produced on
+Linux or macOS.
+
+## Tests
+
+The engine ships an offline regression/stress suite that needs no network:
+
+```bat
+cd engine
+python tests\stress_test.py
+```
+
+It covers playlist pagination, the "Item N" name fallback, per-track
+artwork resolution, the Spotify rate-limit cooldown breaker, malformed and
+hostile inputs, and the queue's progress parser.
 
 ## Versions
 

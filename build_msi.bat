@@ -15,7 +15,7 @@ rem    - the portable app build      -> build.bat (downloads its own deps)
 rem    - WiX Toolset 3.11 binaries   -> downloaded into tools\wix
 rem =====================================================================
 
-set "PRODUCT_VERSION=1.1.0"
+set "PRODUCT_VERSION=1.2.0"
 set "WIX_DIR=tools\wix"
 set "WIX_ZIP_URL=https://github.com/wixtoolset/wix3/releases/download/wix3112rtm/wix311-binaries.zip"
 
