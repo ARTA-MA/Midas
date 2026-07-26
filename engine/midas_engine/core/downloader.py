@@ -13,6 +13,7 @@ where it stopped (--continue is yt-dlp's default).
 import json
 import math
 import os
+import re
 import subprocess
 import threading
 import time
@@ -136,6 +137,50 @@ def _kill_proc_tree(proc: Optional[subprocess.Popen]) -> None:
             pass
 
 
+def _norm_title(text: Optional[str]) -> str:
+    """Loose title key: case/punctuation/spacing differences can't break the
+    match between yt-dlp's progress title and the analyzer's entry title."""
+    return re.sub(r"[^a-z0-9]+", "", str(text or "").lower())
+
+
+def _art_map_from_preview(preview: Dict[str, Any]) -> Dict[str, str]:
+    """title/index -> that track's OWN artwork, from the analyzer's entries.
+
+    This is what lets the queue card show the cover of the track that is
+    downloading instead of the playlist's icon (BUG 7). Keyed by both a
+    normalised title and "#<playlist index>" so a match is found whether or
+    not yt-dlp reports an index for the current item.
+    """
+    art: Dict[str, str] = {}
+    for entry in (preview.get("entries") or []):
+        if not isinstance(entry, dict):
+            continue
+        thumb = entry.get("thumbnail")
+        if not isinstance(thumb, str) or not thumb:
+            continue
+        index = entry.get("index")
+        if isinstance(index, int):
+            art["#" + str(index)] = thumb
+        key = _norm_title(entry.get("title"))
+        if key:
+            art.setdefault(key, thumb)
+    return art
+
+
+def _art_for(item: "DownloadItem", title: Optional[str],
+             index: Optional[int]) -> Optional[str]:
+    """The current track's own cover, by title first then playlist index."""
+    art = item.art_map
+    if not art:
+        return None
+    key = _norm_title(title)
+    if key and art.get(key):
+        return art[key]
+    if isinstance(index, int):
+        return art.get("#" + str(index))
+    return None
+
+
 @dataclass
 class DownloadItem:
     url: str
@@ -161,6 +206,9 @@ class DownloadItem:
     error: Optional[str] = None
     created_at: str = field(default_factory=_now)
     completed_at: Optional[str] = None
+    # index/title -> per-track artwork for playlist jobs (BUG 7). Runtime
+    # only: it is rebuilt from the preview, never persisted to history.
+    art_map: Optional[Dict[str, str]] = field(default=None, repr=False)
     proc: Optional[subprocess.Popen] = field(default=None, repr=False)
     cancelled: bool = field(default=False, repr=False)
     paused: bool = field(default=False, repr=False)
@@ -265,10 +313,27 @@ class DownloadManager:
                 # Make it obvious in Downloads/history that this is a clip.
                 title += (f" [{_fmt_clock(section['start_sec'])}"
                           f"\u2013{_fmt_clock(section['end_sec'])}]")
+            # Per-track artwork for the card (BUG 7): a playlist job shows
+            # the cover of the track it is actually working on, matching
+            # what ends up embedded in the finished files.
+            art_map = _art_map_from_preview(preview)
+            first_art = None
+            if mode == "playlist" and art_map:
+                entries = [e for e in (preview.get("entries") or [])
+                           if isinstance(e, dict)]
+                if selected_indices:
+                    entries = [entries[i] for i in selected_indices
+                               if 0 <= i < len(entries)]
+                for entry in entries:
+                    thumb = entry.get("thumbnail")
+                    if isinstance(thumb, str) and thumb:
+                        first_art = thumb
+                        break
             created.append(DownloadItem(
                 url=url, platform=platform,
                 title=title,
-                thumbnail=preview.get("thumbnail"),
+                thumbnail=first_art or preview.get("thumbnail"),
+                art_map=art_map or None,
                 kind="playlist" if mode == "playlist" else "single",
                 audio_only=platform == "soundcloud" or quality == "audio",
                 overrides=overrides,
@@ -739,6 +804,17 @@ class DownloadManager:
         if title and title != "NA":
             if item.platform != "spotify":  # keep 'Artist - Track' for Spotify
                 item.title = title
+        # Show the artwork of the track being downloaded right now, not the
+        # playlist's icon (BUG 7). The finished file already carries this
+        # exact cover, so the card now matches the file explorer.
+        own_art = _art_for(item, title if title != "NA" else None,
+                           item.item_index)
+        if own_art and own_art != item.thumbnail:
+            item.thumbnail = own_art
+            try:
+                history.upsert(item.to_dict())
+            except Exception:
+                pass  # artwork polish must never break a live download
 
     def _resolve_spotify_art(self, item: DownloadItem) -> None:
         """Swap the shared playlist/album art for this track's own cover
@@ -816,8 +892,7 @@ class DownloadManager:
                     chapters.inject(path, parsed, info.get("duration"))
         except Exception:
             pass  # malformed info.json must not break the remaining files
-        finally:
-            info_path.unlink(missing_ok=True)
+    finally_placeholder = None
 
     @staticmethod
     def _tag_audio(path: Path, meta: Dict[str, Any],
