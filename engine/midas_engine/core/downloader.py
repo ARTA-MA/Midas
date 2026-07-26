@@ -892,7 +892,8 @@ class DownloadManager:
                     chapters.inject(path, parsed, info.get("duration"))
         except Exception:
             pass  # malformed info.json must not break the remaining files
-    finally_placeholder = None
+        finally:
+            info_path.unlink(missing_ok=True)
 
     @staticmethod
     def _tag_audio(path: Path, meta: Dict[str, Any],
