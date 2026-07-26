@@ -292,8 +292,6 @@ def _downloader_stress():
     assert not errors, errors[0]
 
 
-
-
 # ------------------------------------------------------------- 8. analyzer
 @check("analyzer: cache bounded/TTL, entry titles, thumbnails, fast flags")
 def _analyzer_stress():
@@ -471,6 +469,158 @@ def _soundcloud_add_stress():
     assert item.audio_only is False
     assert item.overrides == {"quality": "720"}
     history.clear()
+
+
+# ------------------------------------------- 11. spotify rate-limit breaker
+@check("spotify: 429 cooldown breaker skips the slow path instantly")
+def _spotify_cooldown_stress():
+    from midas_engine.core import spotify
+
+    spotify._API_COOLDOWN["until"] = 0.0
+    assert spotify._api_cooling() is False
+
+    # No Retry-After header -> the sane floor, not "retry immediately".
+    spotify._api_cooldown(0.0)
+    assert spotify._api_cooling() is True
+    left = spotify._API_COOLDOWN["until"] - time.time()
+    assert spotify._COOLDOWN_MIN - 5 <= left <= spotify._COOLDOWN_MIN + 5, left
+
+    # Spotify's real answer is ~19 HOURS; it must be capped, never trusted.
+    spotify._api_cooldown(68242.0)
+    left = spotify._API_COOLDOWN["until"] - time.time()
+    assert left <= spotify._COOLDOWN_MAX + 5, left
+
+    # While cooling, the Web API is skipped without touching the network:
+    # this is the ~30s of retries/sleeps the user used to wait through.
+    t0 = time.monotonic()
+    supply = spotify._TokenSupply("playlist", "pl", {}, spotify._Deadline(5))
+    assert spotify._api_tracks("playlist", "pl", supply,
+                               spotify._Deadline(5)) == []
+    assert time.monotonic() - t0 < 0.10, "cooldown skip must be instant"
+
+    # The persisted-query hash is served from memory: no bundle scraping
+    # (megabytes of JS) unless a caller explicitly asks to refresh it.
+    spotify._HASH_CACHE["hash"] = None
+    t0 = time.monotonic()
+    got = spotify._playlist_query_hash(spotify._Deadline(5), "pl")
+    assert got == spotify._FALLBACK_QUERY_HASH
+    assert time.monotonic() - t0 < 0.10, "hash fast path must not hit network"
+
+    spotify._API_COOLDOWN["until"] = 0.0
+
+
+# ------------------------------------------ 12. per-track artwork in the queue
+@check("downloader: queue shows each track's own art, not the playlist icon")
+def _downloader_artwork_stress():
+    from midas_engine.core import downloader, history
+
+    SET_ICON = "https://cdn.test/set-icon.jpg"
+    preview = {
+        "platform": "soundcloud", "title": "phonk", "kind": "playlist",
+        "thumbnail": SET_ICON, "count": 3,
+        "entries": [
+            {"index": 1, "title": "Polarized", "thumbnail": "https://c/1.jpg"},
+            {"index": 2, "title": "Phonkha X CRXSADER - GODDESS",
+             "thumbnail": "https://c/2.jpg"},
+            {"index": 3, "title": "No Art"},          # art missing -> skipped
+            None, 7, {"index": 4, "thumbnail": 5},     # hostile rows
+        ],
+    }
+
+    art = downloader._art_map_from_preview(preview)
+    assert art["#1"] == "https://c/1.jpg"
+    assert art["#2"] == "https://c/2.jpg"
+    assert "#3" not in art and "#4" not in art
+    assert downloader._art_map_from_preview({}) == {}
+    assert downloader._art_map_from_preview({"entries": None}) == {}
+
+    item = downloader.DownloadItem(id="a", url="u", platform="soundcloud",
+                                  art_map=art)
+    # Title match wins, and survives punctuation/case/spacing drift between
+    # yt-dlp's reported title and the analyzer's entry title.
+    assert downloader._art_for(item, "polarized", None) == "https://c/1.jpg"
+    assert downloader._art_for(
+        item, "PHONKHA  x  crxsader --- Goddess!!", None) == "https://c/2.jpg"
+    # Unknown title falls back to the playlist index.
+    assert downloader._art_for(item, "Totally Unknown", 2) == "https://c/2.jpg"
+    assert downloader._art_for(item, "Totally Unknown", 99) is None
+    assert downloader._art_for(item, None, None) is None
+    # No map (single downloads, other platforms) -> never guesses.
+    bare = downloader.DownloadItem(id="b", url="u", platform="youtube")
+    assert downloader._art_for(bare, "Polarized", 1) is None
+
+    # A playlist add starts on the FIRST TRACK's cover, not the set icon.
+    mgr = downloader.DownloadManager()
+    created = mgr.add("https://soundcloud.com/a/sets/s", "playlist", preview)
+    queued = mgr.items[created[0]["id"]]
+    assert queued.thumbnail == "https://c/1.jpg", queued.thumbnail
+    assert queued.art_map, "playlist adds must carry the art map"
+    assert "art_map" not in queued.to_dict(), "art map must stay internal"
+
+    # ...and follows yt-dlp onto track 2 as the download progresses.
+    apply_p = downloader.DownloadManager._apply_progress
+    fn = getattr(apply_p, "__func__", apply_p)
+    fn(queued, "download:MIDAS|500|1000|NA|100|5|2|3|"
+                "Phonkha X CRXSADER - GODDESS")
+    assert queued.thumbnail == "https://c/2.jpg", queued.thumbnail
+    assert queued.title == "Phonkha X CRXSADER - GODDESS"
+    # A track with no cover of its own keeps the last good image (never blank).
+    fn(queued, "download:MIDAS|10|1000|NA|100|5|3|3|No Art")
+    assert queued.thumbnail == "https://c/2.jpg"
+    # Junk progress lines can't corrupt the artwork or crash the download.
+    for junk in ("", "download:MIDAS|", "a|b|c|d|e|f|g|h|i",
+                 "download:MIDAS|NaN|inf|NA|NA|NA|NA|NA|NA"):
+        fn(queued, junk)
+    assert queued.thumbnail == "https://c/2.jpg"
+
+    # A single (non-playlist) add keeps the track's own preview image.
+    single = mgr.add("https://soundcloud.com/a/track", "single",
+                     {"platform": "soundcloud", "title": "T",
+                      "kind": "single", "thumbnail": "https://c/solo.jpg"})
+    assert mgr.items[single[0]["id"]].thumbnail == "https://c/solo.jpg"
+    history.clear()
+
+
+# -------------------------------------- 13. artwork lookups degrade offline
+@check("soundcloud/analyzer: per-track art lookups degrade without network")
+def _artwork_lookup_stress():
+    from midas_engine.core import analyzer, soundcloud
+
+    # Offline (or a dead set): empty maps, never an exception.
+    soundcloud._PLAYLIST_CACHE.clear()
+    assert soundcloud.track_art("https://soundcloud.com/a/sets/x", 0.2) == {}
+    assert soundcloud.track_names("https://soundcloud.com/a/sets/x", 0.2) == {}
+    assert soundcloud._lookup("https://soundcloud.com/a/sets/x",
+                              "thumbnail", 0.2) == {}
+    # Not a set, or another platform: no lookup is even attempted.
+    assert analyzer._soundcloud_art("https://soundcloud.com/a/track",
+                                    "soundcloud", [{"id": "1"}]) == {}
+    assert analyzer._soundcloud_art("https://youtu.be/x", "youtube",
+                                    [{"id": "1"}]) == {}
+    assert analyzer._soundcloud_art("https://soundcloud.com/a/sets/x",
+                                    "soundcloud", []) == {}
+
+    # Key shapes: id, permalink, and permalink stripped of its query string.
+    keys = analyzer._entry_keys({
+        "id": 123,
+        "webpage_url": "https://soundcloud.com/a/b?utm_source=clipboard",
+        "url": "https://soundcloud.com/a/b/",
+    })
+    assert "123" in keys
+    assert "https://soundcloud.com/a/b" in keys
+    assert analyzer._entry_keys({}) == []
+    assert analyzer._entry_keys({"id": None, "url": {"bad": 1}}) == []
+
+    # Resolution order: the per-track map wins over the flat listing's image.
+    art = {"123": "https://c/track.jpg"}
+    entry = {"id": 123, "thumbnails": [{"url": "https://c/flat.jpg"}]}
+    assert analyzer._entry_thumbnail(entry, art) == "https://c/track.jpg"
+    assert analyzer._entry_thumbnail(entry, {}) == "https://c/flat.jpg"
+    assert analyzer._entry_thumbnail(entry, None) == "https://c/flat.jpg"
+    assert analyzer._entry_thumbnail({"id": 999}, art) is None
+    assert analyzer._entry_thumbnail({}, art) is None
+    # Hostile art maps must not blow up the analyzer.
+    assert analyzer._entry_thumbnail({"id": 123}, {"123": ""}) is None
 
 
 # --------------------------------------------------------------------- runner
