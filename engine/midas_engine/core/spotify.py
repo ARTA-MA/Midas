@@ -218,6 +218,25 @@ class _Deadline:
 # appeared).
 _LIST_CACHE: Dict[Any, Any] = {}
 _HASH_CACHE: Dict[str, Any] = {"checked": 0.0, "hash": None}
+# Spotify answers 429 to anonymous Web API tokens for HOURS at a time
+# (observed Retry-After: ~19h). Waiting on it, or retrying it on every
+# link, is what made analysing a Spotify playlist feel slow, so a 429 is
+# remembered process-wide and the Web API is simply skipped until it
+# expires. Nothing is ever lost: the partner API is the primary path.
+_API_COOLDOWN: Dict[str, float] = {"until": 0.0}
+_COOLDOWN_MIN = 300.0     # seconds, when Spotify sends no Retry-After
+_COOLDOWN_MAX = 3600.0    # seconds, cap so a huge Retry-After isn't forever
+
+
+def _api_cooling() -> bool:
+    """True while the public Web API is known to be rate-limiting us."""
+    return time.time() < _API_COOLDOWN["until"]
+
+
+def _api_cooldown(retry_after: float = 0.0) -> None:
+    """Remember a 429 so no later request wastes the user's time on it."""
+    wait = max(_COOLDOWN_MIN, min(retry_after or 0.0, _COOLDOWN_MAX))
+    _API_COOLDOWN["until"] = time.time() + wait
 def _token_candidates(kind: str, sid: str,
                       data: Optional[Dict[str, Any]] = None,
                       deadline: Optional[_Deadline] = None):
@@ -296,6 +315,11 @@ def _api_tracks(kind: str, sid: str, supply: "_TokenSupply",
     plural = "albums" if kind == "album" else "playlists"
     limit = 50 if kind == "album" else 100
     base = f"https://api.spotify.com/v1/{plural}/{sid}/tracks"
+    if _api_cooling():
+        # Straight past the rate limiter instead of into it (BUG 6).
+        logs.log("Spotify Web API is still rate-limited; skipping it and "
+                 "using the partner API instead.", source="spotify")
+        return []
     token = supply.next()
     if not token:
         logs.log("Spotify: no anonymous token from any source; only the "
@@ -306,7 +330,6 @@ def _api_tracks(kind: str, sid: str, supply: "_TokenSupply",
     collected: List[Any] = []
     url: Optional[str] = f"{base}?limit={limit}&offset=0"
     pages = 0
-    rate_limited = 0
     while url:
         pages += 1
         if pages > 300:
@@ -336,19 +359,18 @@ def _api_tracks(kind: str, sid: str, supply: "_TokenSupply",
                      source="spotify")
             break
         if resp.status_code == 429:
-            rate_limited += 1
-            if rate_limited > 3 or (deadline is not None
-                                    and deadline.expired()):
-                logs.log("Spotify Web API keeps rate-limiting; keeping "
-                         f"the {len(collected)} row(s) fetched so far.",
-                         level="warning", source="spotify")
-                break
+            # Do NOT sleep and retry: that is exactly what made every
+            # Spotify link take ~30s before falling back (BUG 6). Record
+            # the cooldown, stop instantly, keep whatever came back.
             try:
-                delay = min(float(resp.headers.get("Retry-After") or 2), 10.0)
+                retry_after = float(resp.headers.get("Retry-After") or 0)
             except (TypeError, ValueError):
-                delay = 2.0
-            time.sleep(delay)
-            continue
+                retry_after = 0.0
+            _api_cooldown(retry_after)
+            logs.log("Spotify Web API is rate-limiting; switching to the "
+                     f"partner API (kept {len(collected)} row(s)).",
+                     source="spotify")
+            break
         if resp.status_code != 200:
             logs.log(f"Spotify Web API answered {resp.status_code}; "
                      "falling back to the embed list.",
@@ -370,107 +392,224 @@ def _api_tracks(kind: str, sid: str, supply: "_TokenSupply",
     return _clean_tracklist(collected)
 
 
-_QUERY_HASH_RE = re.compile(
-    r'"fetchPlaylistContents"\s*,\s*"([0-9a-f]{64})"')
-_QUERY_HASH_LOOSE_RE = re.compile(
-    r'fetchPlaylistContents.{0,300}?([0-9a-f]{64})', re.DOTALL)
+# ---------------------------------------------------------------------------
+# Partner GraphQL API (api-partner.spotify.com) - the SAME API the logged-out
+# web player paginates a playlist with. This is what lifts the 100-track cap
+# (BUG 1) with nothing for the user to provide: no login, no API keys, no
+# client secret. Verified against a 323-track playlist.
+# ---------------------------------------------------------------------------
+
+# The web-player bundle registers persisted queries as
+#   new X("fetchPlaylistContents", "query", "<sha256>", null)
+# so the hash is the THIRD argument, not the second. The old pattern only
+# accepted name+hash and therefore never matched -> no pagination at all.
+_QUERY_HASH_RES = (
+    re.compile(r'"fetchPlaylistContents"\s*,\s*"query"\s*,\s*'
+               r'"([0-9a-f]{64})"'),
+    re.compile(r'"fetchPlaylistContents"\s*,\s*"([0-9a-f]{64})"'),
+    re.compile(r'fetchPlaylistContents.{0,400}?([0-9a-f]{64})', re.DOTALL),
+)
+_SCRIPT_SRC_RE = re.compile(r'<script[^>]+src="(https://[^"]+\.js)"')
 _BUNDLE_RE = re.compile(
-    r'https://open\.spotifycdn\.com/cdn/build/web-player/[\w.-]+\.js')
+    r'https://open\.spotifycdn\.com/cdn/build/web-player/[\w.~-]+\.js')
+# Last-known-good hash, used only if every live lookup fails, so a
+# temporarily unreachable CDN never costs the user their full playlist.
+_FALLBACK_QUERY_HASH = (
+    "e4b2953f160e58e38ac025d79b5a9b3aceee5c4c716598e9830bfceb69faff5f")
+_PARTNER_ENDPOINTS = (
+    ("GET", "https://" + "api-partner.spotify.com/pathfinder/v1/query"),
+    ("POST", "https://" + "api-partner.spotify.com/pathfinder/v2/query"),
+)
 
 
-def _playlist_query_hash(
-        deadline: Optional[_Deadline] = None) -> Optional[str]:
+def _bundle_urls(sid: Optional[str] = None,
+                 deadline: Optional[_Deadline] = None) -> List[str]:
+    """Web-player JS bundle URLs, from the playlist page and the home page.
+
+    The old code scraped open.spotify.com/ only and matched bundle URLs
+    with a pattern that the current markup never yields (0 bundles found),
+    so the query hash was never discovered. Reading the <script src=...>
+    tags of the playlist page itself is what actually works today.
+    """
+    pages = []
+    if sid:
+        pages.append("https://" + "open.spotify.com/playlist/" + sid)
+    pages.append("https://" + "open.spotify.com/")
+    urls: List[str] = []
+    for page in pages:
+        if deadline is not None and deadline.expired():
+            break
+        try:
+            r = httpx.get(page, headers=_HEADERS, timeout=12,
+                          follow_redirects=True)
+        except Exception:
+            continue
+        found = [u for u in _SCRIPT_SRC_RE.findall(r.text)
+                 if "open.spotifycdn.com" in u]
+        found += _BUNDLE_RE.findall(r.text)
+        # web-player.*.js carries the persisted queries; try it first.
+        found.sort(key=lambda u: ("web-player." not in u.rsplit("/", 1)[-1],
+                                  u))
+        for u in found:
+            if u not in urls:
+                urls.append(u)
+        if urls:
+            break
+    return urls
+
+
+def _playlist_query_hash(deadline: Optional[_Deadline] = None,
+                         sid: Optional[str] = None,
+                         refresh: bool = False) -> Optional[str]:
     """Persisted-query hash for fetchPlaylistContents, read live from the
     web player's own JS bundles (it changes between releases, so it can
     never be hardcoded)."""
-    if _HASH_CACHE["hash"] or time.time() - _HASH_CACHE["checked"] < 900:
-        return _HASH_CACHE["hash"]
+    if not refresh:
+        # Fast path, no network at all: the known-good hash is tried
+        # optimistically. Scraping the web player's JS bundles up front
+        # cost seconds and several megabytes on every single link; it now
+        # only happens if Spotify actually rejects the persisted query
+        # (_partner_page reports "stale-hash"), which is rare (BUG 6).
+        return _HASH_CACHE.get("hash") or _FALLBACK_QUERY_HASH
     _HASH_CACHE["checked"] = time.time()
-    try:
-        r = httpx.get("https://" + "open.spotify.com/", headers=_HEADERS,
-                      timeout=12, follow_redirects=True)
-        for bundle in _BUNDLE_RE.findall(r.text)[:3]:
-            if deadline is not None and deadline.expired():
-                return None
-            try:
-                js = httpx.get(bundle, headers=_HEADERS, timeout=15).text
-            except Exception:
-                continue
-            m = _QUERY_HASH_RE.search(js) or _QUERY_HASH_LOOSE_RE.search(js)
+    for bundle in _bundle_urls(sid, deadline)[:6]:
+        if deadline is not None and deadline.expired():
+            break
+        try:
+            js = httpx.get(bundle, headers=_HEADERS, timeout=25).text
+        except Exception:
+            continue
+        for pattern in _QUERY_HASH_RES:
+            m = pattern.search(js)
             if m:
                 _HASH_CACHE["hash"] = m.group(1)
                 return m.group(1)
-    except Exception:
-        pass
-    return None
+    logs.log("Spotify partner API: query hash not found in the web-player "
+             "bundle; using the last known good hash.", level="warning",
+             source="spotify")
+    return _HASH_CACHE.get("hash") or _FALLBACK_QUERY_HASH
+
+
+def _partner_headers(token: str) -> Dict[str, str]:
+    headers = dict(_HEADERS, Authorization="Bearer " + token)
+    headers["app-platform"] = "WebPlayer"
+    headers["accept"] = "application/json"
+    headers["content-type"] = "application/json;charset=UTF-8"
+    headers["origin"] = "https://" + "open.spotify.com"
+    headers["referer"] = "https://" + "open.spotify.com/"
+    return headers
+
+
+def _partner_page(sid: str, token: str, query_hash: str, offset: int,
+                  limit: int = 100) -> Any:
+    """One page of playlist rows. Tries pathfinder v1 (GET) then v2 (POST).
+
+    Returns the parsed JSON of the first 200 answer, the string
+    "stale-hash" when Spotify rejected the persisted query (the bundle
+    rotated), or None when neither endpoint answered.
+    """
+    variables = {"uri": "spotify:playlist:" + sid, "offset": offset,
+                 "limit": limit}
+    extensions = {"persistedQuery": {"version": 1,
+                                     "sha256Hash": query_hash}}
+    stale = False
+    for method, endpoint in _PARTNER_ENDPOINTS:
+        try:
+            if method == "GET":
+                resp = httpx.get(endpoint, params={
+                    "operationName": "fetchPlaylistContents",
+                    "variables": json.dumps(variables),
+                    "extensions": json.dumps(extensions),
+                }, headers=_partner_headers(token), timeout=25)
+            else:
+                resp = httpx.post(endpoint, json={
+                    "operationName": "fetchPlaylistContents",
+                    "variables": variables,
+                    "extensions": extensions,
+                }, headers=_partner_headers(token), timeout=25)
+        except Exception as exc:
+            logs.log("Spotify partner API request failed: " + str(exc)[:120],
+                     level="warning", source="spotify")
+            continue
+        if resp.status_code == 200:
+            try:
+                payload = resp.json()
+            except Exception:
+                continue
+            blob = str(payload)[:400]
+            if "PersistedQueryNotFound" in blob or "NOT_FOUND" in blob:
+                stale = True
+                continue
+            return payload
+        if resp.status_code in (400, 404) and "persisted" in resp.text.lower():
+            stale = True
+            continue
+        logs.log("Spotify partner API answered " + str(resp.status_code)
+                 + " (" + method + ").", level="warning", source="spotify")
+    return "stale-hash" if stale else None
 
 
 def _pathfinder_tracks(sid: str, tokens: List[str],
-                       deadline: Optional[_Deadline] = None
+                       deadline: Optional[_Deadline] = None,
+                       refresh_hash: bool = False
                        ) -> List[Dict[str, Any]]:
-    """Full playlist via the partner GraphQL API the web player uses.
+    """FULL playlist via the partner GraphQL API the web player uses.
 
-    Second, independent pagination path for when api.spotify.com stops
-    accepting anonymous tokens: open.spotify.com can still list a full
-    playlist while logged out, and this is the API it does that with.
+    This is the path that removes the 100-track ceiling: open.spotify.com
+    lists a whole playlist while logged out, and this is the API it does
+    that with. Pagination follows the authoritative totalCount and
+    deduplicates rows, so a playlist of any size comes back complete.
     """
-    query_hash = _playlist_query_hash(deadline)
+    query_hash = _playlist_query_hash(deadline, sid, refresh=refresh_hash)
     if not query_hash:
-        logs.log("Spotify partner API: query hash not found in the "
-                 "web-player bundle.", level="warning", source="spotify")
         return []
-    endpoint = "https://" + "api-partner.spotify.com/pathfinder/v1/query"
     best: List[Any] = []
     for token in tokens:
-        headers = dict(_HEADERS, Authorization=f"Bearer {token}")
-        headers["app-platform"] = "WebPlayer"
         collected: List[Any] = []
+        seen: set = set()
         offset = 0
         total: Optional[int] = None
-        pages = 0
+        refreshed = False
         while total is None or offset < total:
-            pages += 1
-            if pages > 300:
-                break
             if deadline is not None and deadline.expired():
-                logs.log("Spotify partner API: time budget reached; "
-                         f"keeping the {len(collected)} row(s) fetched "
-                         "so far.", level="warning", source="spotify")
+                logs.log("Spotify partner API: time budget reached; keeping "
+                         "the " + str(len(collected)) + " row(s) fetched so "
+                         "far.", level="warning", source="spotify")
                 break
-            params = {
-                "operationName": "fetchPlaylistContents",
-                "variables": json.dumps(
-                    {"uri": f"spotify:playlist:{sid}",
-                     "offset": offset, "limit": 100}),
-                "extensions": json.dumps(
-                    {"persistedQuery":
-                        {"version": 1, "sha256Hash": query_hash}}),
-            }
-            try:
-                resp = httpx.get(endpoint, params=params, headers=headers,
-                                 timeout=20)
-            except Exception as exc:
-                logs.log(f"Spotify partner API request failed: "
-                         f"{str(exc)[:120]}", level="warning",
-                         source="spotify")
+            payload = _partner_page(sid, token, query_hash, offset)
+            if payload == "stale-hash" and not refreshed:
+                # The web player shipped a new bundle: re-read the hash
+                # once and retry this page instead of giving up.
+                refreshed = True
+                fresh = _playlist_query_hash(deadline, sid, refresh=True)
+                if fresh and fresh != query_hash:
+                    query_hash = fresh
+                    continue
                 break
-            if resp.status_code != 200:
-                logs.log(f"Spotify partner API answered "
-                         f"{resp.status_code}.", level="warning",
-                         source="spotify")
+            if not isinstance(payload, dict):
                 break
-            content = _find_key(resp.json(), "content") or {}
+            content = _find_key(payload, "content") or {}
             items = (content.get("items")
                      if isinstance(content, dict) else None)
             if not isinstance(items, list) or not items:
                 break
-            collected.extend(items)
             got = content.get("totalCount")
-            if isinstance(got, int):
+            if isinstance(got, int) and got > 0:
                 total = got
-            elif total is None:
-                break
+            new_rows = 0
+            for row in items:
+                track = _unwrap_track(row)
+                key = (track.get("uri") or track.get("id")
+                       if isinstance(track, dict) else None)
+                if key and key in seen:
+                    continue
+                if key:
+                    seen.add(key)
+                collected.append(row)
+                new_rows += 1
             offset += len(items)
+            if new_rows == 0 and total is None:
+                break
         if len(collected) > len(best):
             best = collected
         if total is not None and len(best) >= total:
@@ -557,24 +696,46 @@ def _extract_tracklist(data: Dict[str, Any], kind: str,
     if kind in ("album", "playlist"):
         expected = _find_key(data, "totalCount")
         expected = expected if isinstance(expected, int) else None
-        deadline = _Deadline(10.0)
+        # A 300+ track playlist needs several API pages; 10s was not
+        # enough and truncated long lists back to the embed page's 100.
+        deadline = _Deadline(30.0)
         supply = _TokenSupply(kind, sid, data, deadline)
-        api_tracks = _api_tracks(kind, sid, supply, deadline)
-        if api_tracks:
-            logs.log(f"Spotify Web API listed {len(api_tracks)} track(s) "
-                     f"for this {kind}.", source="spotify")
-        tracks = max(tracks, api_tracks, key=len)
-        # When the Web API stops accepting anonymous tokens, the partner
-        # GraphQL API (what open.spotify.com itself paginates with while
-        # logged out) is a second, independent path to the FULL list.
-        need_more = ((expected is not None and len(tracks) < expected)
-                     or not api_tracks)
-        if kind == "playlist" and need_more and supply.known():
+        # PARTNER API FIRST (BUG 6). It is both complete and fast: one
+        # request per 100 tracks, no rate limiting in practice. The public
+        # Web API used to run first, and since it answers 429 to anonymous
+        # tokens for hours on end, every Spotify link paid ~30s of retries
+        # and sleeps before the working path was even tried.
+        pf_tracks: List[Dict[str, Any]] = []
+        if kind == "playlist" and supply.known():
             pf_tracks = _pathfinder_tracks(sid, supply.known(), deadline)
             if pf_tracks:
                 logs.log(f"Spotify partner API listed {len(pf_tracks)} "
                          "track(s) for this playlist.", source="spotify")
                 tracks = max(tracks, pf_tracks, key=len)
+        # Only bother with the Web API when the partner API did not already
+        # return everything (albums always, since the partner query above
+        # is playlist-only).
+        complete = (expected is not None and len(tracks) >= expected)
+        if not complete and not (pf_tracks and len(tracks) > 100):
+            api_tracks = _api_tracks(kind, sid, supply, deadline)
+            if api_tracks:
+                logs.log(f"Spotify Web API listed {len(api_tracks)} track(s) "
+                         f"for this {kind}.", source="spotify")
+            tracks = max(tracks, api_tracks, key=len)
+            # Last chance for a playlist the partner API could not read at
+            # all (e.g. a brand-new persisted-query hash AND a cold cache):
+            # an embed list of exactly 100 rows is the classic "capped at
+            # one page" signature, so retry the partner path once with a
+            # freshly scraped hash (BUG 1).
+            if (kind == "playlist" and not pf_tracks and supply.known()
+                    and (len(tracks) >= 100
+                         or (expected is not None and len(tracks) < expected))):
+                retry = _pathfinder_tracks(sid, supply.known(), deadline,
+                                           refresh_hash=True)
+                if retry:
+                    logs.log(f"Spotify partner API listed {len(retry)} "
+                             "track(s) for this playlist.", source="spotify")
+                    tracks = max(tracks, retry, key=len)
 
     # c. Last resort: the mobile embed page sometimes ships a different
     #    JSON structure. (Never one oEmbed call per track — far too slow.)
@@ -657,6 +818,14 @@ def resolve_tracks(url: str) -> List[Dict[str, Any]]:
         artist = t.get("subtitle") or _artists_of(t) or _artists_of(entity)
         album_name = (t.get("albumName")
                       if isinstance(t.get("albumName"), str) else "")
+        if not album_name:
+            # Partner-API rows carry the album under albumOfTrack/album.
+            for key in ("albumOfTrack", "album"):
+                nested = t.get(key)
+                if isinstance(nested, dict) and isinstance(
+                        nested.get("name"), str):
+                    album_name = nested["name"]
+                    break
         own_cover = _track_cover(t)
         return {
             "title": title,
