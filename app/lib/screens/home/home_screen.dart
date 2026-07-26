@@ -902,10 +902,16 @@ class _PlaylistPickerDialogState extends State<_PlaylistPickerDialog> {
                                 _selected.remove(entry.index);
                               }
                             }),
-                            title: Text('${entry.index}.  ${entry.title}',
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                                style: MidasTheme.ui(13)),
+                            title: Row(children: [
+                              _entryArtwork(entry.thumbnail),
+                              Expanded(
+                                child: Text(
+                                    '${entry.index}.  ${entry.title}',
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: MidasTheme.ui(13)),
+                              ),
+                            ]),
                             secondary: entry.duration != null
                                 ? Text(formatDuration(entry.duration),
                                     style: MidasTheme.ui(11.5,
@@ -948,6 +954,25 @@ class _PlaylistPickerDialogState extends State<_PlaylistPickerDialog> {
       ],
     );
   }
+}
+
+/// Small rounded cover for one picker row: the track's OWN artwork (BUG 7),
+/// so the list looks like the files that will land on disk. Silently
+/// collapses to nothing when a track has no art of its own.
+Widget _entryArtwork(String? url) {
+  if (url == null || url.isEmpty) return const SizedBox.shrink();
+  return Padding(
+    padding: const EdgeInsets.only(right: 10),
+    child: ClipRRect(
+      borderRadius: BorderRadius.circular(4),
+      child: Image.network(url,
+          width: 28,
+          height: 28,
+          fit: BoxFit.cover,
+          gaplessPlayback: true,
+          errorBuilder: (_, __, ___) => const SizedBox.shrink()),
+    ),
+  );
 }
 
 class _SpotifyChoice {
@@ -1080,10 +1105,16 @@ class _SpotifyTrackPickerDialogState
                                 _selected.remove(entry.index);
                               }
                             }),
-                            title: Text('${entry.index}.  ${_label(entry)}',
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                                style: MidasTheme.ui(13)),
+                            title: Row(children: [
+                              _entryArtwork(entry.thumbnail),
+                              Expanded(
+                                child: Text(
+                                    '${entry.index}.  ${_label(entry)}',
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: MidasTheme.ui(13)),
+                              ),
+                            ]),
                             secondary: entry.duration != null
                                 ? Text(formatDuration(entry.duration),
                                     style: MidasTheme.ui(11.5,
@@ -1230,4 +1261,3 @@ class _LogPanel extends ConsumerWidget {
     );
   }
 }
-
