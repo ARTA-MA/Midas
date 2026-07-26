@@ -33,9 +33,17 @@ set "PYTHON_CMD=%TOOLS_DIR%\python\tools\python.exe"
 echo    - Python ready.
 
 rem ----------------------------------------------- Flutter ----
+rem Always hand the caller the FULL path of flutter.bat. A bare "flutter"
+rem breaks CALL: cmd does not apply PATHEXT to a quoted target, so it picks
+rem the extension-less shell script that also lives in flutter\bin and every
+rem invocation dies with "The system cannot find the path specified."
 set "FLUTTER_CMD="
-where flutter >nul 2>nul
-if not errorlevel 1 set "FLUTTER_CMD=flutter"
+set "FLUTTER_ANY="
+for /f "delims=" %%i in ('where flutter 2^>nul') do (
+    if not defined FLUTTER_ANY set "FLUTTER_ANY=%%i"
+    if /i "%%~xi"==".bat" if not defined FLUTTER_CMD set "FLUTTER_CMD=%%i"
+)
+if not defined FLUTTER_CMD if defined FLUTTER_ANY set "FLUTTER_CMD=%FLUTTER_ANY%"
 if defined FLUTTER_CMD goto :flutter_done
 if exist "%TOOLS_DIR%\flutter\bin\flutter.bat" goto :flutter_local
 
@@ -60,6 +68,10 @@ del "%TOOLS_DIR%\git.zip"
 :git_path
 set "PATH=%TOOLS_DIR%\git\cmd;%PATH%"
 :flutter_done
+if not exist "%FLUTTER_CMD%" (
+    echo    ! Flutter was found on PATH but "%FLUTTER_CMD%" is not a file.
+    goto :boot_fail
+)
 echo    - Flutter ready.
 
 rem ------------------ Visual C++ Build Tools (for Flutter) ----

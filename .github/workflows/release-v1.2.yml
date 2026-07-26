@@ -37,7 +37,19 @@ jobs:
           python-version: "3.12"
 
       - name: Enable Windows desktop support
-        run: flutter config --enable-windows-desktop
+        run: |
+          flutter --version
+          flutter config --enable-windows-desktop
+
+      # app/windows/ holds only the icon, so the runner project is generated
+      # per build. Doing it here (instead of leaving it to build.bat) keeps any
+      # toolchain error in plain sight in this log.
+      - name: Generate the Windows runner project
+        shell: cmd
+        working-directory: app
+        run: |
+          call flutter create --platforms=windows --project-name midas .
+          if not exist windows\CMakeLists.txt exit /b 1
 
       - name: Engine regression suite (offline)
         working-directory: engine

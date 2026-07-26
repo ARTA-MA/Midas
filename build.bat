@@ -38,6 +38,7 @@ for /d %%D in ("%PUB_CACHE%\hosted\pub.dev\*") do if not exist "%%D\lib" (
 rem The in-project cache from the previous version is no longer used.
 if exist "tools\pub-cache" rmdir /s /q "tools\pub-cache"
 echo   - Package cache: %LOCALAPPDATA%\Midas\pub-cache
+echo   - Flutter SDK: %FLUTTER_CMD%
 
 rem ---------- [2/8] python venv ----------
 echo [2/8] Creating Python environment for the engine...
@@ -90,6 +91,14 @@ pushd app
 if not exist windows\CMakeLists.txt (
     echo   - Creating the Windows runner project ^(one time^)...
     call "%FLUTTER_CMD%" create --platforms=windows --project-name midas . || (popd & goto :fail)
+    rem A failed CALL does not always set errorlevel, so verify the result:
+    rem without CMakeLists.txt there is nothing for MSVC to compile.
+    if not exist windows\CMakeLists.txt (
+        echo   ! Flutter did not generate app\windows\CMakeLists.txt.
+        echo     Check the message above, then run:  flutter doctor -v
+        popd
+        goto :fail
+    )
 )
 copy /y windows\midas.ico windows\runner\resources\app_icon.ico >nul
 rem Clear stale package-resolution state (old paths break the compile after
@@ -100,6 +109,11 @@ if exist .flutter-plugins del /q .flutter-plugins
 if exist .flutter-plugins-dependencies del /q .flutter-plugins-dependencies
 call "%FLUTTER_CMD%" pub get || (popd & goto :fail)
 call "%FLUTTER_CMD%" build windows --release || (popd & goto :fail)
+if not exist build\windows\x64\runner\Release\midas.exe (
+    echo   ! The Flutter release build produced no executable.
+    popd
+    goto :fail
+)
 popd
 echo   - Flutter app built.
 
