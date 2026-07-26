@@ -9,7 +9,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from .. import config
 from ..settings import load as load_settings
-from . import logs, spotify
+from . import logs, soundcloud, spotify
 
 _NO_WINDOW = 0x08000000 if config.IS_WINDOWS else 0
 
@@ -259,16 +259,102 @@ def _slug_name(entry: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-def _entry_title(entry: Dict[str, Any], index: int) -> str:
+def _entry_title(entry: Dict[str, Any], index: int,
+                 names: Optional[Dict[str, str]] = None) -> str:
     """Readable playlist-entry name; never a bare "Item N" when avoidable.
 
-    Flat-playlist entries (SoundCloud sets especially) may omit titles, so a
-    name is derived from the track URL slug before falling back.
+    Flat-playlist entries (SoundCloud sets especially) omit titles entirely,
+    so the real name is looked up in `names` (id/URL -> title, fetched from
+    SoundCloud's own public metadata) first, then derived from the track URL
+    slug, and only then falls back to "Item N".
     """
     title = str(entry.get("title") or "").strip()
     if title:
         return title
+    if names:
+        for key in (entry.get("id"), entry.get("webpage_url"),
+                    entry.get("url")):
+            if not isinstance(key, (str, int)):
+                continue
+            candidate = str(key).rstrip("/").split("?")[0]
+            found = names.get(candidate) or names.get(str(key))
+            if found:
+                return found
     return _slug_name(entry) or f"Item {index + 1}"
+
+
+def _soundcloud_names(url: str, platform: Optional[str],
+                      entries: List[Dict[str, Any]]) -> Dict[str, str]:
+    """Real track names for a SoundCloud set (fixes the "Item N" rows).
+
+    yt-dlp's cheap flat listing returns `title: null` for every track of a
+    SoundCloud set, which is why the picker used to show "Item 1", "Item
+    2", ... Deep per-track extraction is not an option (it trips
+    SoundCloud's rate limiter), so the names come from SoundCloud's own
+    public set page + batched public track API - no login, no keys, and
+    only a couple of requests for a whole set.
+
+    Only runs when names are actually missing, and any failure returns an
+    empty map so analysis keeps working exactly as before.
+    """
+    if platform != "soundcloud" or not entries:
+        return {}
+    if not any(not str((e or {}).get("title") or "").strip()
+               for e in entries):
+        return {}
+    if not soundcloud.is_playlist_url(url):
+        return {}
+    try:
+        return soundcloud.track_names(url)
+    except Exception as exc:
+        logs.log("SoundCloud name lookup failed: " + str(exc)[:120],
+                 level="warning", source="soundcloud")
+        return {}
+
+
+def _soundcloud_art(url: str, platform: Optional[str],
+                    entries: List[Dict[str, Any]]) -> Dict[str, str]:
+    """Each track's OWN cover art for a SoundCloud set (fixes the picker
+    and the queue showing the set's icon for every track - BUG 7).
+
+    Free of extra cost: the set page this reads was already fetched and
+    cached by the name lookup above.
+    """
+    if platform != "soundcloud" or not entries:
+        return {}
+    if not soundcloud.is_playlist_url(url):
+        return {}
+    try:
+        return soundcloud.track_art(url)
+    except Exception as exc:
+        logs.log("SoundCloud artwork lookup failed: " + str(exc)[:120],
+                 level="warning", source="soundcloud")
+        return {}
+
+
+def _entry_keys(entry: Dict[str, Any]) -> List[str]:
+    """Every string key a flat-playlist entry can be looked up by."""
+    keys: List[str] = []
+    for key in (entry.get("id"), entry.get("webpage_url"), entry.get("url")):
+        if not isinstance(key, (str, int)):
+            continue
+        keys.append(str(key))
+        keys.append(str(key).rstrip("/").split("?")[0])
+    return keys
+
+
+def _entry_thumbnail(entry: Dict[str, Any],
+                     art: Optional[Dict[str, str]] = None) -> Optional[str]:
+    """This entry's own artwork: the platform's per-track cover when known,
+    otherwise whatever thumbnail the flat listing carried. Never the
+    playlist's icon - the caller falls back to that only if this is None.
+    """
+    if art:
+        for key in _entry_keys(entry):
+            found = art.get(key)
+            if found:
+                return found
+    return _best_thumbnail(entry)
 
 
 def analyze(url: str) -> Dict[str, Any]:
@@ -307,6 +393,8 @@ def analyze(url: str) -> Dict[str, Any]:
         kind = "both" if (platform == "youtube" and _youtube_has_both(url)) else "playlist"
 
     logs.log(f"Analyzed OK: {info.get('title') or url}", source="analyzer")
+    names = _soundcloud_names(url, platform, entries) if is_playlist else {}
+    art = _soundcloud_art(url, platform, entries) if is_playlist else {}
     payload = {
         "platform": platform,
         "kind": kind,
@@ -328,9 +416,11 @@ def analyze(url: str) -> Dict[str, Any]:
             {
                 "index": i + 1,
                 "id": (e or {}).get("id"),
-                "title": _entry_title(e or {}, i),
+                "title": _entry_title(e or {}, i, names),
                 "duration": (e or {}).get("duration"),
                 "url": (e or {}).get("webpage_url") or (e or {}).get("url"),
+                # Per-track cover for the picker and the queue card (BUG 7).
+                "thumbnail": _entry_thumbnail(e or {}, art),
             }
             for i, e in enumerate(entries[:2000])
         ] if is_playlist else [],
