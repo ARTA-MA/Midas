@@ -9,6 +9,8 @@ class PlaylistEntry {
   final String artist; // Spotify track picker (BUG 5); '' elsewhere
   final int? duration;
   final String? url;
+  /// This track's OWN cover art, never the playlist's icon (BUG 7).
+  final String? thumbnail;
 
   const PlaylistEntry({
     required this.index,
@@ -17,6 +19,7 @@ class PlaylistEntry {
     this.artist = '',
     this.duration,
     this.url,
+    this.thumbnail,
   });
 
   factory PlaylistEntry.fromJson(Map<String, dynamic> json) => PlaylistEntry(
@@ -26,6 +29,7 @@ class PlaylistEntry {
         artist: (json['artist'] ?? '') as String,
         duration: (json['duration'] as num?)?.toInt(),
         url: json['url'] as String?,
+        thumbnail: json['thumbnail'] as String?,
       );
 }
 
