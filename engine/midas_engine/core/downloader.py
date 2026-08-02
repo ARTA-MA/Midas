@@ -81,6 +81,24 @@ def _fmt_clock(sec: int) -> str:
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 
+def _output_template(template: str, section: Optional[Dict[str, int]]) -> str:
+    """Give a clip its own filename so it never collides with the full video.
+
+    Without this, a clip of a video that was already downloaded in full
+    resolves to the exact same path, yt-dlp reports "has already been
+    downloaded" and skips the job - handing the user the whole video
+    instead of the range they asked for.
+    """
+    if not section:
+        return template
+    suffix = (f" [clip {_hms(section['start_sec']).replace(':', '-')}"
+              f"-{_hms(section['end_sec']).replace(':', '-')}]")
+    marker = ".%(ext)s"
+    if template.endswith(marker):
+        return template[:-len(marker)] + suffix + marker
+    return template + suffix
+
+
 def _parse_section(section: Optional[Dict[str, Any]]
                    ) -> Optional[Dict[str, int]]:
     """Normalize a {start_sec, end_sec} clip range from the request."""
@@ -531,7 +549,8 @@ class DownloadManager:
                "--progress-template", PROGRESS_TMPL,
                "--retries", str(s.retries), "--windows-filenames",
                "--trim-filenames", "150",
-               "-o", str(out_dir / s.filename_template),
+               "-o", str(out_dir / _output_template(s.filename_template,
+                                                    item.section)),
                "--print-to-file", "after_move:filepath", str(printfile)]
         # Prefer the portable vendor ffmpeg; fall back to one on PATH.
         if config.FFMPEG_PATH.exists():
