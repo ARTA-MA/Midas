@@ -623,6 +623,56 @@ def _artwork_lookup_stress():
     assert analyzer._entry_thumbnail({"id": 123}, {"123": ""}) is None
 
 
+# ------------------------------------------------- 14. clip filename collision
+@check("downloader: a clip gets its own filename, never the full video's")
+def _clip_filename_collision():
+    from midas_engine.core import downloader
+    from midas_engine.settings import Settings
+
+    tmpl = "%(title)s [%(id)s].%(ext)s"
+    sec = {"start_sec": 10, "end_sec": 20}
+
+    # No section -> the template is untouched.
+    assert downloader._output_template(tmpl, None) == tmpl
+    assert downloader._output_template(tmpl, {}) == tmpl
+
+    # A clip gets a distinct, still-templated name with no ":" (Windows-safe).
+    clip = downloader._output_template(tmpl, sec)
+    assert clip == "%(title)s [%(id)s] [clip 00-00-10-00-00-20].%(ext)s", clip
+    assert clip != tmpl and ":" not in clip and clip.endswith(".%(ext)s")
+
+    # Templates that do not end in the ext marker still come out distinct.
+    odd = downloader._output_template("%(title)s", sec)
+    assert odd != "%(title)s" and "clip" in odd
+
+    # Different ranges of the same video never share a filename.
+    other = downloader._output_template(tmpl, {"start_sec": 30,
+                                               "end_sec": 40})
+    assert other != clip
+
+    # End to end: _build_cmd must actually emit the clip-specific -o, so a
+    # previously downloaded full video can't make yt-dlp skip the clip.
+    mgr = downloader.DownloadManager()
+    s = Settings(output_dir=str(_TMP), per_platform_subfolders=False)
+    printfile = _TMP / "p.txt"
+
+    full = downloader.DownloadItem(id="full", url="u", platform="youtube")
+    cmd_full = mgr._build_cmd(full, s, printfile)
+    out_full = cmd_full[cmd_full.index("-o") + 1]
+
+    clipped = downloader.DownloadItem(id="clip", url="u", platform="youtube",
+                                      section={"start_sec": 10,
+                                               "end_sec": 20})
+    cmd_clip = mgr._build_cmd(clipped, s, printfile)
+    out_clip = cmd_clip[cmd_clip.index("-o") + 1]
+
+    assert out_full != out_clip, (out_full, out_clip)
+    assert "clip 00-00-10-00-00-20" in out_clip
+    # The range itself is still requested from yt-dlp.
+    assert "--download-sections" in cmd_clip
+    assert "*00:00:10-00:00:20" in cmd_clip
+
+
 # --------------------------------------------------------------------- runner
 def main():
     print(f"MIDAS stress tests  (python {sys.version.split()[0]}, "

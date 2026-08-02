@@ -6,6 +6,28 @@ version are attached to the matching entry on the
 
 ---
 
+## v1.2.1
+
+### Fixed
+- **Downloading a clip of a video you already had gave you the whole video.**
+  A time-range download reused the full video's output filename, so yt-dlp
+  found the existing file, reported *"has already been downloaded"* and
+  skipped the job - while the queue still reported **completed**. Clips now
+  get their own `[clip HH-MM-SS-HH-MM-SS]` filename, so a range can never
+  collide with the full video, and two different ranges of the same video no
+  longer overwrite each other. The suffix is added before the `.%(ext)s`
+  marker and contains no `:`, so it stays Windows-safe.
+
+### Added
+- A 14th offline regression check (`engine/tests/stress_test.py`) pinning the
+  clip output template and asserting that `_build_cmd` emits a
+  clip-specific `-o` while still passing `--download-sections`.
+- `docs/SMOKE_TEST_2026-08-02.md` - the full five-platform download matrix
+  (YouTube, Spotify, SoundCloud, TikTok, Instagram) used to validate this
+  release, including single, playlist, audio-only and clip jobs.
+
+---
+
 ## v1.2.0
 
 ### Added
